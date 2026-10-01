@@ -59,6 +59,11 @@ on:
         required: false
         type: string
         default: ""
+      kernel_source_commit:
+        description: "Exact kernel/common commit SHA"
+        required: false
+        type: string
+        default: ""
       brand_name:
         required: false
         type: string
@@ -159,6 +164,7 @@ jobs:
         android_version: ${{ inputs.android_version }}
         kernel_version: ${{ inputs.kernel_version }}
         os_patch_level: ${{ inputs.os_patch_level }}
+        kernel_source_commit: ${{ inputs.kernel_source_commit }}
 
     - name: Set Build Timestamp from Kernel Commit
       shell: bash
