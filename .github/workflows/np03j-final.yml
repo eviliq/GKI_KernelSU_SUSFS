@@ -6,6 +6,7 @@ on:
   push:
     branches:
       - np03j-phase1-final
+      - main
     paths:
       - '.github/workflows/np03j-final.yml'
       - '.github/workflows/build.yml'
@@ -57,136 +58,129 @@ jobs:
           if-no-files-found: error
           compression-level: 9
 
-  build-manager:
-    name: Build matching official KernelSU Next manager
+  fetch-manager:
+    name: Fetch exact official signed KernelSU Next manager
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
     steps:
-      - name: Clone exact official KernelSU Next manager source
-        shell: bash
-        run: |
-          set -euo pipefail
-          git clone --filter=blob:none --no-checkout https://github.com/KernelSU-Next/KernelSU-Next.git ksunext
-          git -C ksunext fetch origin "${NP03J_KSUNEXT_MANAGER_COMMIT}"
-          git -C ksunext checkout --detach --quiet "${NP03J_KSUNEXT_MANAGER_COMMIT}"
-          ACTUAL="$(git -C ksunext rev-parse HEAD)"
-          [ "$ACTUAL" = "${NP03J_KSUNEXT_MANAGER_COMMIT}" ]
-
-          COUNT="$(git -C ksunext rev-list --count HEAD)"
-          VERSION_CODE="$((30000 + COUNT))"
-          echo "MANAGER_COMMIT=$ACTUAL"
-          echo "MANAGER_COMMIT_COUNT=$COUNT"
-          echo "MANAGER_VERSION_CODE=$VERSION_CODE"
-          [ "$VERSION_CODE" = "33313" ]
-
-          {
-            echo "MANAGER_COMMIT=$ACTUAL"
-            echo "MANAGER_COMMIT_COUNT=$COUNT"
-            echo "MANAGER_VERSION_CODE=$VERSION_CODE"
-          } > manager-source.txt
-
-      - name: Setup Android NDK
-        uses: nttld/setup-ndk@v1
-        id: setup-ndk
-        with:
-          ndk-version: r29
-
-      - name: Setup Java
-        uses: actions/setup-java@v5
-        with:
-          distribution: temurin
-          java-version: 21
-
-      - name: Setup Gradle
-        uses: gradle/actions/setup-gradle@v5
-
-      - name: Prepare Rust targets
-        shell: bash
-        run: |
-          set -euo pipefail
-          rustup update stable
-          rustup target add aarch64-linux-android
-
-      - name: Build arm64 ksuinit
+      - name: Resolve exact official manager CI run
+        id: resolve
         shell: bash
         env:
-          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          LLVM_BIN="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
-          export CLANG_PATH="$LLVM_BIN/aarch64-linux-android26-clang"
-          export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$CLANG_PATH"
-          BUILTINS="$($CLANG_PATH --print-resource-dir)/lib/linux/libclang_rt.builtins-aarch64-android.a"
-          export RUSTFLAGS="-C target-feature=+crt-static -C link-arg=-Wl,-z,max-page-size=16384 -C link-arg=-Wno-unused-command-line-argument -C link-arg=$BUILTINS"
 
-          cargo build \
-            --manifest-path ksunext/userspace/ksuinit/Cargo.toml \
-            --target=aarch64-linux-android \
-            --release
+          OWNER="KernelSU-Next"
+          REPO="KernelSU-Next"
+          WORKFLOW="build-manager-ci.yml"
+          COMMIT="${NP03J_KSUNEXT_MANAGER_COMMIT}"
+          EXPECTED_VERSION_CODE="33313"
 
-          mkdir -p ksunext/userspace/ksud/bin/aarch64
-          cp -f \
-            ksunext/userspace/ksuinit/target/aarch64-linux-android/release/ksuinit \
-            ksunext/userspace/ksud/bin/aarch64/ksuinit
+          if ! [[ "$COMMIT" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "Invalid manager commit: $COMMIT" >&2
+            exit 2
+          fi
 
-      - name: Build arm64 ksud
+          API="https://api.github.com/repos/${OWNER}/${REPO}/actions/workflows/${WORKFLOW}/runs?head_sha=${COMMIT}&per_page=100"
+          JSON="$(curl --fail --location --silent --show-error \
+            --retry 5 --retry-delay 5 --retry-all-errors \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "$API")"
+
+          RUN_ID="$(jq -r '[.workflow_runs[] | select(.conclusion == "success")][0].id // empty' <<< "$JSON")"
+          if [ -z "$RUN_ID" ]; then
+            echo "ERROR: no successful official Build Manager CI run exists for exact commit $COMMIT." >&2
+            echo "Refusing to substitute a differently signed or differently versioned manager." >&2
+            exit 1
+          fi
+
+          RUN_SHA="$(jq -r --argjson id "$RUN_ID" '.workflow_runs[] | select(.id == $id) | .head_sha' <<< "$JSON")"
+          if [ "$RUN_SHA" != "$COMMIT" ]; then
+            echo "Manager CI head mismatch: expected $COMMIT, got $RUN_SHA" >&2
+            exit 1
+          fi
+
+          echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
+          echo "version_code=$EXPECTED_VERSION_CODE" >> "$GITHUB_OUTPUT"
+          echo "OFFICIAL_MANAGER_RUN=https://github.com/${OWNER}/${REPO}/actions/runs/${RUN_ID}"
+          echo "OFFICIAL_MANAGER_COMMIT=$RUN_SHA"
+          echo "OFFICIAL_MANAGER_VERSION_CODE=$EXPECTED_VERSION_CODE"
+
+      - name: Download exact official manager artifact
+        id: download
         shell: bash
         env:
-          ANDROID_NDK_ROOT: ${{ steps.setup-ndk.outputs.ndk-path }}
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ steps.resolve.outputs.run_id }}
+          EXPECTED_VERSION_CODE: ${{ steps.resolve.outputs.version_code }}
         run: |
           set -euo pipefail
-          cargo install cross --git https://github.com/cross-rs/cross --rev 66845c1 --locked
 
-          clang --target=aarch64-linux-gnu -c -nostdlib \
-            -o ksunext/userspace/ksud/.lkm_image_bootstrap.o \
-            ksunext/userspace/ksud/src/lkm_image_bootstrap.S
+          OWNER="KernelSU-Next"
+          REPO="KernelSU-Next"
+          mkdir -p official-manager
 
-          export BINDGEN_EXTRA_CLANG_ARGS_aarch64_linux_android="--sysroot=$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/sysroot -I$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include/aarch64-linux-android -I$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include"
+          AJSON="$(curl --fail --location --silent --show-error \
+            --retry 5 --retry-delay 5 --retry-all-errors \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/${OWNER}/${REPO}/actions/runs/${RUN_ID}/artifacts?per_page=100")"
 
-          CROSS_NO_WARNINGS=0 cross build \
-            --target aarch64-linux-android \
-            --release \
-            --manifest-path ksunext/userspace/ksud/Cargo.toml
+          ARTIFACT_ID="$(jq -r '[.artifacts[] | select(.name == "manager" and .expired == false)][0].id // empty' <<< "$AJSON")"
+          if [ -z "$ARTIFACT_ID" ]; then
+            echo "ERROR: exact official manager artifact is missing or expired for run $RUN_ID." >&2
+            exit 1
+          fi
 
-          mkdir -p ksunext/manager/app/src/main/jniLibs/arm64-v8a
-          cp -f \
-            ksunext/userspace/ksud/target/aarch64-linux-android/release/ksud \
-            ksunext/manager/app/src/main/jniLibs/arm64-v8a/libksud.so
+          curl --fail --location --silent --show-error \
+            --retry 5 --retry-delay 5 --retry-all-errors \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            -o manager-artifact.zip \
+            "https://api.github.com/repos/${OWNER}/${REPO}/actions/artifacts/${ARTIFACT_ID}/zip"
 
-      - name: Build manager APK
-        shell: bash
-        working-directory: ksunext/manager
-        run: |
-          set -euo pipefail
-          chmod +x gradlew
-          ./gradlew clean assembleRelease
+          unzip -q manager-artifact.zip -d official-manager
+          rm -f manager-artifact.zip
 
-      - name: Verify manager artifact
-        shell: bash
-        run: |
-          set -euo pipefail
-          mapfile -t APKS < <(find ksunext/manager/app/build/outputs/apk/release -type f -name '*.apk' | sort)
+          mapfile -t APKS < <(find official-manager -type f -name '*.apk' | sort)
           if [ "${#APKS[@]}" -ne 1 ]; then
-            echo "Expected exactly one release manager APK, found ${#APKS[@]}" >&2
+            echo "Expected exactly one APK in official manager artifact; found ${#APKS[@]}." >&2
             printf '%s\n' "${APKS[@]}" >&2
             exit 1
           fi
 
           APK="${APKS[0]}"
-          SHA="$(sha256sum "$APK" | awk '{print $1}')"
-          echo "MANAGER_APK=$APK"
-          echo "MANAGER_APK_SHA256=$SHA"
-          {
-            cat manager-source.txt
-            echo "MANAGER_APK_SHA256=$SHA"
-          } > manager-build.txt
+          NAME="$(basename "$APK")"
+          if [[ "$NAME" != *"_${EXPECTED_VERSION_CODE}-release.apk" ]]; then
+            echo "Manager filename/version mismatch: $NAME" >&2
+            exit 1
+          fi
 
-      - name: Upload matching manager
+          SHA="$(sha256sum "$APK" | awk '{print $1}')"
+          echo "OFFICIAL_MANAGER_APK=$NAME"
+          echo "OFFICIAL_MANAGER_SHA256=$SHA"
+
+          {
+            echo "manager_source=KernelSU-Next/KernelSU-Next"
+            echo "manager_commit=${NP03J_KSUNEXT_MANAGER_COMMIT}"
+            echo "manager_version_code=${EXPECTED_VERSION_CODE}"
+            echo "manager_run_id=${RUN_ID}"
+            echo "manager_apk=${NAME}"
+            echo "manager_sha256=${SHA}"
+          } > official-manager/NP03J_MANAGER_PROVENANCE.txt
+
+      - name: Upload exact official signed manager
         uses: actions/upload-artifact@v7
         with:
           name: NP03J-KernelSU-Next-Manager-33313
-          path: |
-            ksunext/manager/app/build/outputs/apk/release/*.apk
-            manager-build.txt
+          path: official-manager/
           if-no-files-found: error
           compression-level: 9
 
