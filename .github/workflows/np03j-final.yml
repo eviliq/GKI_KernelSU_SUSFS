@@ -1,0 +1,220 @@
+name: NP03J Final Kernel Build
+
+run-name: NP03J Android14-6.1 LTS 4K KernelSU-Next BUILT-IN
+
+on:
+  push:
+    branches:
+      - np03j-phase1-final
+    paths:
+      - '.github/workflows/np03j-final.yml'
+      - '.github/workflows/build.yml'
+      - '.github/actions/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: write
+
+env:
+  NP03J_KERNEL_SOURCE_COMMIT: 38c2ee7f1213aaa84824aa93e0fbfb80bdb3efb6
+  NP03J_KSUNEXT_KERNEL_COMMIT: 4c5853188012f63a1a1fedd4a57fda6375fecb38
+  NP03J_KSUNEXT_MANAGER_COMMIT: 2b31f7185460e99bc3896a639e9073b1c354ee0d
+  NP03J_SUSFS_BASE_COMMIT: 24743360ea08d98f6ad72b856851abed8de5854f
+  NP03J_NOMOUNT_COMMIT: e2513c3ac3f91cfb7fda395d88b5344bb97398cb
+  NP03J_KERNEL_PATCHES_COMMIT: 41ae18b35d20e0c6ac04116785a4a1089528ae94
+  NP03J_ANYKERNEL3_COMMIT: e1e9dce98430c5c6f231f7094a8c7f4ecaf50948
+  NP03J_DROIDSPACES_COMMIT: 434d795d80f34852251599cf412841c493aa7177
+  NP03J_BBG_COMMIT: a54e0dc6cf0aff4dd87fec49644a02d2eb612905
+
+jobs:
+  build-nomount-metamodule:
+    name: Build matching NoMount metamodule
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout NP03J workflow branch
+        uses: actions/checkout@v7
+
+      - name: Build pinned NoMount metamodule
+        id: nomount
+        uses: ./.github/actions/nomount-metamodule
+        with:
+          commit: e2513c3ac3f91cfb7fda395d88b5344bb97398cb
+
+      - name: Verify NoMount source pin
+        shell: bash
+        run: |
+          set -euo pipefail
+          [ "${{ steps.nomount.outputs.commit }}" = "${NP03J_NOMOUNT_COMMIT}" ]
+          test -f "${{ steps.nomount.outputs.module_path }}"
+          sha256sum "${{ steps.nomount.outputs.module_path }}"
+
+      - name: Upload matching NoMount metamodule
+        uses: actions/upload-artifact@v7
+        with:
+          name: NoMount-Metamodule
+          path: ${{ steps.nomount.outputs.module_path }}
+          if-no-files-found: error
+          compression-level: 9
+
+  build-manager:
+    name: Build matching official KernelSU Next manager
+    runs-on: ubuntu-latest
+    steps:
+      - name: Clone exact official KernelSU Next manager source
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --filter=blob:none --no-checkout https://github.com/KernelSU-Next/KernelSU-Next.git ksunext
+          git -C ksunext fetch origin "${NP03J_KSUNEXT_MANAGER_COMMIT}"
+          git -C ksunext checkout --detach --quiet "${NP03J_KSUNEXT_MANAGER_COMMIT}"
+          ACTUAL="$(git -C ksunext rev-parse HEAD)"
+          [ "$ACTUAL" = "${NP03J_KSUNEXT_MANAGER_COMMIT}" ]
+
+          COUNT="$(git -C ksunext rev-list --count HEAD)"
+          VERSION_CODE="$((30000 + COUNT))"
+          echo "MANAGER_COMMIT=$ACTUAL"
+          echo "MANAGER_COMMIT_COUNT=$COUNT"
+          echo "MANAGER_VERSION_CODE=$VERSION_CODE"
+          [ "$VERSION_CODE" = "33313" ]
+
+          {
+            echo "MANAGER_COMMIT=$ACTUAL"
+            echo "MANAGER_COMMIT_COUNT=$COUNT"
+            echo "MANAGER_VERSION_CODE=$VERSION_CODE"
+          } > manager-source.txt
+
+      - name: Setup Android NDK
+        uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          ndk-version: r29
+
+      - name: Setup Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v5
+
+      - name: Prepare Rust targets
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup update stable
+          rustup target add aarch64-linux-android
+
+      - name: Build arm64 ksuinit
+        shell: bash
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          set -euo pipefail
+          LLVM_BIN="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          export CLANG_PATH="$LLVM_BIN/aarch64-linux-android26-clang"
+          export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$CLANG_PATH"
+          BUILTINS="$($CLANG_PATH --print-resource-dir)/lib/linux/libclang_rt.builtins-aarch64-android.a"
+          export RUSTFLAGS="-C target-feature=+crt-static -C link-arg=-Wl,-z,max-page-size=16384 -C link-arg=-Wno-unused-command-line-argument -C link-arg=$BUILTINS"
+
+          cargo build \
+            --manifest-path ksunext/userspace/ksuinit/Cargo.toml \
+            --target=aarch64-linux-android \
+            --release
+
+          mkdir -p ksunext/userspace/ksud/bin/aarch64
+          cp -f \
+            ksunext/userspace/ksuinit/target/aarch64-linux-android/release/ksuinit \
+            ksunext/userspace/ksud/bin/aarch64/ksuinit
+
+      - name: Build arm64 ksud
+        shell: bash
+        env:
+          ANDROID_NDK_ROOT: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          set -euo pipefail
+          cargo install cross --git https://github.com/cross-rs/cross --rev 66845c1 --locked
+
+          clang --target=aarch64-linux-gnu -c -nostdlib \
+            -o ksunext/userspace/ksud/.lkm_image_bootstrap.o \
+            ksunext/userspace/ksud/src/lkm_image_bootstrap.S
+
+          export BINDGEN_EXTRA_CLANG_ARGS_aarch64_linux_android="--sysroot=$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/sysroot -I$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include/aarch64-linux-android -I$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include"
+
+          CROSS_NO_WARNINGS=0 cross build \
+            --target aarch64-linux-android \
+            --release \
+            --manifest-path ksunext/userspace/ksud/Cargo.toml
+
+          mkdir -p ksunext/manager/app/src/main/jniLibs/arm64-v8a
+          cp -f \
+            ksunext/userspace/ksud/target/aarch64-linux-android/release/ksud \
+            ksunext/manager/app/src/main/jniLibs/arm64-v8a/libksud.so
+
+      - name: Build manager APK
+        shell: bash
+        working-directory: ksunext/manager
+        run: |
+          set -euo pipefail
+          chmod +x gradlew
+          ./gradlew clean assembleRelease
+
+      - name: Verify manager artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t APKS < <(find ksunext/manager/app/build/outputs/apk/release -type f -name '*.apk' | sort)
+          if [ "${#APKS[@]}" -ne 1 ]; then
+            echo "Expected exactly one release manager APK, found ${#APKS[@]}" >&2
+            printf '%s\n' "${APKS[@]}" >&2
+            exit 1
+          fi
+
+          APK="${APKS[0]}"
+          SHA="$(sha256sum "$APK" | awk '{print $1}')"
+          echo "MANAGER_APK=$APK"
+          echo "MANAGER_APK_SHA256=$SHA"
+          {
+            cat manager-source.txt
+            echo "MANAGER_APK_SHA256=$SHA"
+          } > manager-build.txt
+
+      - name: Upload matching manager
+        uses: actions/upload-artifact@v7
+        with:
+          name: NP03J-KernelSU-Next-Manager-33313
+          path: |
+            ksunext/manager/app/build/outputs/apk/release/*.apk
+            manager-build.txt
+          if-no-files-found: error
+          compression-level: 9
+
+  build-kernel:
+    name: Build NP03J KernelSU Next BUILT-IN kernel
+    needs:
+      - build-nomount-metamodule
+    uses: ./.github/workflows/build.yml
+    with:
+      version: android14-6.1
+      android_version: android14
+      kernel_version: '6.1'
+      sublevel: 'X'
+      os_patch_level: lts
+      variant: NP03J
+      feature_set: 'SUSFS+NoMount+BBG+NET+DS+NTSync+Ptrace+Unicode+BPF'
+      ksu_branch: 2b31f7185460e99bc3896a639e9073b1c354ee0d
+      susfs_commit: 24743360ea08d98f6ad72b856851abed8de5854f
+      root_flavor: next
+      root_commit: 4c5853188012f63a1a1fedd4a57fda6375fecb38
+      nomount_commit: e2513c3ac3f91cfb7fda395d88b5344bb97398cb
+      kernel_patches_commit: 41ae18b35d20e0c6ac04116785a4a1089528ae94
+      anykernel3_commit: e1e9dce98430c5c6f231f7094a8c7f4ecaf50948
+      droidspaces_commit: 434d795d80f34852251599cf412841c493aa7177
+      kernel_source_commit: 38c2ee7f1213aaa84824aa93e0fbfb80bdb3efb6
+      brand_name: Wild
+      keep_kmi: false
+      allow_version_mismatch: false
+      use_cache: false
+      page_size: 4k
+    secrets: inherit
