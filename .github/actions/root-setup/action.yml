@@ -26,7 +26,8 @@ runs:
             manager="KernelSU Manager"
             ;;
           next)
-            repo="https://github.com/KernelSU-Next/KernelSU-Next.git"
+            # NP03J audited SUSFS-capable KernelSU-Next kernel-side fork.
+            repo="https://github.com/pershoot/KernelSU-Next.git"
             directory="KernelSU-Next"
             manager="KernelSU Next Manager"
             ;;
