@@ -1,0 +1,215 @@
+name: NP03J Final Kernel Build
+
+run-name: NP03J Android14-6.1 LTS 4K KernelSU-Next BUILT-IN
+
+on:
+  push:
+    branches:
+      - np03j-phase1-final
+      - main
+    paths:
+      - '.github/workflows/np03j-final.yml'
+      - '.github/workflows/build.yml'
+      - '.github/actions/**'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: write
+
+env:
+  NP03J_KERNEL_SOURCE_COMMIT: 38c2ee7f1213aaa84824aa93e0fbfb80bdb3efb6
+  NP03J_KSUNEXT_KERNEL_COMMIT: 4c5853188012f63a1a1fedd4a57fda6375fecb38
+  NP03J_KSUNEXT_MANAGER_COMMIT: 2b31f7185460e99bc3896a639e9073b1c354ee0d
+  NP03J_SUSFS_BASE_COMMIT: 24743360ea08d98f6ad72b856851abed8de5854f
+  NP03J_NOMOUNT_COMMIT: e2513c3ac3f91cfb7fda395d88b5344bb97398cb
+  NP03J_KERNEL_PATCHES_COMMIT: 41ae18b35d20e0c6ac04116785a4a1089528ae94
+  NP03J_ANYKERNEL3_COMMIT: e1e9dce98430c5c6f231f7094a8c7f4ecaf50948
+  NP03J_DROIDSPACES_COMMIT: 434d795d80f34852251599cf412841c493aa7177
+  NP03J_BBG_COMMIT: a54e0dc6cf0aff4dd87fec49644a02d2eb612905
+
+jobs:
+  build-nomount-metamodule:
+    name: Build matching NoMount metamodule
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout NP03J workflow branch
+        uses: actions/checkout@v7
+
+      - name: Build pinned NoMount metamodule
+        id: nomount
+        uses: ./.github/actions/nomount-metamodule
+        with:
+          commit: e2513c3ac3f91cfb7fda395d88b5344bb97398cb
+
+      - name: Verify NoMount source pin
+        shell: bash
+        run: |
+          set -euo pipefail
+          [ "${{ steps.nomount.outputs.commit }}" = "${NP03J_NOMOUNT_COMMIT}" ]
+          test -f "${{ steps.nomount.outputs.module_path }}"
+          sha256sum "${{ steps.nomount.outputs.module_path }}"
+
+      - name: Upload matching NoMount metamodule
+        uses: actions/upload-artifact@v7
+        with:
+          name: NoMount-Metamodule
+          path: ${{ steps.nomount.outputs.module_path }}
+          if-no-files-found: error
+          compression-level: 9
+
+  fetch-manager:
+    name: Fetch exact official signed KernelSU Next manager
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - name: Resolve exact official manager CI run
+        id: resolve
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          OWNER="KernelSU-Next"
+          REPO="KernelSU-Next"
+          WORKFLOW="build-manager-ci.yml"
+          COMMIT="${NP03J_KSUNEXT_MANAGER_COMMIT}"
+          EXPECTED_VERSION_CODE="33313"
+
+          if ! [[ "$COMMIT" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "Invalid manager commit: $COMMIT" >&2
+            exit 2
+          fi
+
+          API="https://api.github.com/repos/${OWNER}/${REPO}/actions/workflows/${WORKFLOW}/runs?head_sha=${COMMIT}&per_page=100"
+          JSON="$(curl --fail --location --silent --show-error \
+            --retry 5 --retry-delay 5 --retry-all-errors \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "$API")"
+
+          RUN_ID="$(jq -r '[.workflow_runs[] | select(.conclusion == "success")][0].id // empty' <<< "$JSON")"
+          if [ -z "$RUN_ID" ]; then
+            echo "ERROR: no successful official Build Manager CI run exists for exact commit $COMMIT." >&2
+            echo "Refusing to substitute a differently signed or differently versioned manager." >&2
+            exit 1
+          fi
+
+          RUN_SHA="$(jq -r --argjson id "$RUN_ID" '.workflow_runs[] | select(.id == $id) | .head_sha' <<< "$JSON")"
+          if [ "$RUN_SHA" != "$COMMIT" ]; then
+            echo "Manager CI head mismatch: expected $COMMIT, got $RUN_SHA" >&2
+            exit 1
+          fi
+
+          echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
+          echo "version_code=$EXPECTED_VERSION_CODE" >> "$GITHUB_OUTPUT"
+          echo "OFFICIAL_MANAGER_RUN=https://github.com/${OWNER}/${REPO}/actions/runs/${RUN_ID}"
+          echo "OFFICIAL_MANAGER_COMMIT=$RUN_SHA"
+          echo "OFFICIAL_MANAGER_VERSION_CODE=$EXPECTED_VERSION_CODE"
+
+      - name: Download exact official manager artifact
+        id: download
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ steps.resolve.outputs.run_id }}
+          EXPECTED_VERSION_CODE: ${{ steps.resolve.outputs.version_code }}
+        run: |
+          set -euo pipefail
+
+          OWNER="KernelSU-Next"
+          REPO="KernelSU-Next"
+          mkdir -p official-manager
+
+          AJSON="$(curl --fail --location --silent --show-error \
+            --retry 5 --retry-delay 5 --retry-all-errors \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/${OWNER}/${REPO}/actions/runs/${RUN_ID}/artifacts?per_page=100")"
+
+          ARTIFACT_ID="$(jq -r '[.artifacts[] | select(.name == "manager" and .expired == false)][0].id // empty' <<< "$AJSON")"
+          if [ -z "$ARTIFACT_ID" ]; then
+            echo "ERROR: exact official manager artifact is missing or expired for run $RUN_ID." >&2
+            exit 1
+          fi
+
+          curl --fail --location --silent --show-error \
+            --retry 5 --retry-delay 5 --retry-all-errors \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            -o manager-artifact.zip \
+            "https://api.github.com/repos/${OWNER}/${REPO}/actions/artifacts/${ARTIFACT_ID}/zip"
+
+          unzip -q manager-artifact.zip -d official-manager
+          rm -f manager-artifact.zip
+
+          mapfile -t APKS < <(find official-manager -type f -name '*.apk' | sort)
+          if [ "${#APKS[@]}" -ne 1 ]; then
+            echo "Expected exactly one APK in official manager artifact; found ${#APKS[@]}." >&2
+            printf '%s\n' "${APKS[@]}" >&2
+            exit 1
+          fi
+
+          APK="${APKS[0]}"
+          NAME="$(basename "$APK")"
+          if [[ "$NAME" != *"_${EXPECTED_VERSION_CODE}-release.apk" ]]; then
+            echo "Manager filename/version mismatch: $NAME" >&2
+            exit 1
+          fi
+
+          SHA="$(sha256sum "$APK" | awk '{print $1}')"
+          echo "OFFICIAL_MANAGER_APK=$NAME"
+          echo "OFFICIAL_MANAGER_SHA256=$SHA"
+
+          {
+            echo "manager_source=KernelSU-Next/KernelSU-Next"
+            echo "manager_commit=${NP03J_KSUNEXT_MANAGER_COMMIT}"
+            echo "manager_version_code=${EXPECTED_VERSION_CODE}"
+            echo "manager_run_id=${RUN_ID}"
+            echo "manager_apk=${NAME}"
+            echo "manager_sha256=${SHA}"
+          } > official-manager/NP03J_MANAGER_PROVENANCE.txt
+
+      - name: Upload exact official signed manager
+        uses: actions/upload-artifact@v7
+        with:
+          name: NP03J-KernelSU-Next-Manager-33313
+          path: official-manager/
+          if-no-files-found: error
+          compression-level: 9
+
+  build-kernel:
+    name: Build NP03J KernelSU Next BUILT-IN kernel
+    needs:
+      - build-nomount-metamodule
+    uses: ./.github/workflows/build.yml
+    with:
+      version: android14-6.1
+      android_version: android14
+      kernel_version: '6.1'
+      sublevel: 'X'
+      os_patch_level: lts
+      variant: NP03J
+      feature_set: 'SUSFS+NoMount+BBG+NET+DS+NTSync+Ptrace+Unicode+BPF'
+      ksu_branch: 2b31f7185460e99bc3896a639e9073b1c354ee0d
+      susfs_commit: 24743360ea08d98f6ad72b856851abed8de5854f
+      root_flavor: next
+      root_commit: 4c5853188012f63a1a1fedd4a57fda6375fecb38
+      nomount_commit: e2513c3ac3f91cfb7fda395d88b5344bb97398cb
+      kernel_patches_commit: 41ae18b35d20e0c6ac04116785a4a1089528ae94
+      anykernel3_commit: e1e9dce98430c5c6f231f7094a8c7f4ecaf50948
+      droidspaces_commit: 434d795d80f34852251599cf412841c493aa7177
+      kernel_source_commit: 38c2ee7f1213aaa84824aa93e0fbfb80bdb3efb6
+      brand_name: Wild
+      keep_kmi: false
+      allow_version_mismatch: false
+      use_cache: false
+      page_size: 4k
+    secrets: inherit
+# trigger: actions-enabled

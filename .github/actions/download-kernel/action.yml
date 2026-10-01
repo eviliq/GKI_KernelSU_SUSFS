@@ -14,6 +14,10 @@ inputs:
   os_patch_level:
     description: 'OS patch level (e.g., 2024-01)'
     required: true
+  kernel_source_commit:
+    description: 'Optional exact kernel/common commit SHA to pin after repo sync'
+    required: false
+    default: ''
 
 outputs:
   deprecated_branch:
@@ -129,6 +133,30 @@ runs:
           fi
           attempt=$((attempt+1))
         done
+
+    - name: Pin kernel/common to exact commit
+      if: inputs.kernel_source_commit != ''
+      shell: bash
+      working-directory: ${{ github.workspace }}/kernel
+      run: |
+        set -euo pipefail
+        EXPECTED="${{ inputs.kernel_source_commit }}"
+        if ! [[ "$EXPECTED" =~ ^[0-9a-f]{40}$ ]]; then
+          echo "kernel_source_commit must be a full 40-character SHA." >&2
+          exit 2
+        fi
+        if [ ! -d common/.git ]; then
+          echo "kernel/common git checkout not found." >&2
+          exit 1
+        fi
+        git -C common fetch --depth=1 https://android.googlesource.com/kernel/common "$EXPECTED"
+        git -C common checkout --detach --quiet "$EXPECTED"
+        ACTUAL="$(git -C common rev-parse HEAD)"
+        if [ "$ACTUAL" != "$EXPECTED" ]; then
+          echo "kernel/common pin mismatch: expected $EXPECTED, got $ACTUAL" >&2
+          exit 1
+        fi
+        echo "Pinned kernel/common to $ACTUAL"
 
     # --- Non-repo steps (commented out; we only use repo now) ---
     # - name: Download manifest.xml for branch (with deprecated fallback)

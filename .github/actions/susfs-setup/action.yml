@@ -1,27 +1,26 @@
 name: 'Setup SUSFS Branch'
-description: 'Clone SUSFS repo and cherry-pick commits'
+description: 'Clone SUSFS at an immutable revision and apply the audited NP03J LTS delta'
 inputs:
   susfs_commit:
-    description: 'SUSFS commit hash (empty = latest on auto-derived gki-{version} branch)'
+    description: 'Exact SUSFS base commit SHA'
     required: false
     default: ""
   version:
-    description: 'Kernel config version (e.g., android15-6.6)'
+    description: 'Kernel config version (e.g., android14-6.1)'
     required: true
   root_flavor:
-    description: 'Selected root implementation - pershoot patches only apply to next'
+    description: 'Selected root implementation'
     required: false
     default: ""
 
 runs:
   using: "composite"
   steps:
-    - name: Clone SUSFS Branch
+    - name: Clone pinned SUSFS and apply audited LTS delta
       shell: bash
       run: |
         set -euo pipefail
 
-        # Retry transient network errors (up to 5 attempts, 5s backoff).
         retry() {
           local n=0
           until [ "$n" -ge 5 ]; do
@@ -35,26 +34,65 @@ runs:
 
         SUSFS_BRANCH="gki-${{ inputs.version }}"
         SUSFS_REPO="https://gitlab.com/simonpunk/susfs4ksu.git"
+        SUSFS_DIR="${{ github.workspace }}/susfs4ksu"
+        EXPECTED_BASE="${{ inputs.susfs_commit }}"
 
-        echo "Preparing SUSFS for branch: $SUSFS_BRANCH"
-        echo "Cloning latest from $SUSFS_BRANCH..."
-        retry git clone "$SUSFS_REPO" -b "$SUSFS_BRANCH" susfs4ksu
+        rm -rf "$SUSFS_DIR"
 
-        if [ -n "${{ inputs.susfs_commit }}" ]; then
-          echo "Checking out SUSFS commit: ${{ inputs.susfs_commit }}"
-          retry git -C "${{ github.workspace }}/susfs4ksu" checkout "${{ inputs.susfs_commit }}"
+        if [ -n "$EXPECTED_BASE" ]; then
+          if ! [[ "$EXPECTED_BASE" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "SUSFS commit must be a full 40-character SHA." >&2
+            exit 2
+          fi
+
+          retry git clone --no-checkout "$SUSFS_REPO" "$SUSFS_DIR"
+          retry git -C "$SUSFS_DIR" fetch --depth=1 origin "$EXPECTED_BASE"
+          git -C "$SUSFS_DIR" checkout --detach --quiet "$EXPECTED_BASE"
+        else
+          echo "WARNING: no SUSFS pin supplied; using branch tip $SUSFS_BRANCH" >&2
+          retry git clone --depth=1 --branch "$SUSFS_BRANCH" "$SUSFS_REPO" "$SUSFS_DIR"
+          EXPECTED_BASE="$(git -C "$SUSFS_DIR" rev-parse HEAD)"
         fi
 
-        cd "${{ github.workspace }}/susfs4ksu"
-        SUSFS_COMMIT="$(git rev-parse HEAD)"
-        echo "SUSFS_COMMIT=$SUSFS_COMMIT" >> "$GITHUB_ENV"
-        echo "Using SUSFS commit: $SUSFS_COMMIT"
+        ACTUAL_BASE="$(git -C "$SUSFS_DIR" rev-parse HEAD)"
+        if [ "$ACTUAL_BASE" != "$EXPECTED_BASE" ]; then
+          echo "SUSFS base mismatch: expected $EXPECTED_BASE, got $ACTUAL_BASE" >&2
+          exit 1
+        fi
 
-        # Pershoot's latest two gki-android14-6.1-dev commits (currently the
-        # no-features core build + Toolkit coexistence fixes) only apply to
-        # KernelSU-Next (dev-susfs fork). Other flavors use the simonpunk
-        # checkout as-is.
-        if [ "${{ inputs.root_flavor }}" = "next" ]; then
-          git fetch https://gitlab.com/pershoot/susfs4ksu.git gki-android14-6.1-dev || true
-          git log ..FETCH_HEAD --oneline -n 2 | awk '{print $1}' | tac | xargs git cherry-pick 2>/dev/null || true
+        echo "SUSFS_BASE_COMMIT=$ACTUAL_BASE" >> "$GITHUB_ENV"
+        echo "SUSFS_COMMIT=$ACTUAL_BASE" >> "$GITHUB_ENV"
+        echo "Using SUSFS base: $ACTUAL_BASE"
+
+        # NP03J target: Android14-6.1 LTS + KernelSU-Next.
+        # This three-commit set was independently proven to produce exactly
+        # the same tree as pershoot gki-android14-6.1-lts-dev at
+        # 79ecabe1aa6f3d0e00668d5a3902879d67652189.
+        if [ "${{ inputs.root_flavor }}" = "next" ] && [ "${{ inputs.version }}" = "android14-6.1" ]; then
+          PERSHOOT_REPO="https://gitlab.com/pershoot/susfs4ksu.git"
+          PERSHOOT_COMMITS=(
+            "88df19e864e90f738610b455706931476641b8d9"
+            "6d4f9a92ac7946d9d2d1904149d764506c9ae7b9"
+            "79ecabe1aa6f3d0e00668d5a3902879d67652189"
+          )
+          EXPECTED_TREE="b5bab5ca2caf7c828450765f65bf748f399998e6"
+
+          git -C "$SUSFS_DIR" config user.name "github-actions[bot]"
+          git -C "$SUSFS_DIR" config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          for commit in "${PERSHOOT_COMMITS[@]}"; do
+            echo "Applying pinned Pershoot LTS delta: $commit"
+            retry git -C "$SUSFS_DIR" fetch --no-tags "$PERSHOOT_REPO" "$commit"
+            git -C "$SUSFS_DIR" cherry-pick "$commit"
+          done
+
+          ACTUAL_TREE="$(git -C "$SUSFS_DIR" rev-parse 'HEAD^{tree}')"
+          if [ "$ACTUAL_TREE" != "$EXPECTED_TREE" ]; then
+            echo "Pershoot LTS tree mismatch: expected $EXPECTED_TREE, got $ACTUAL_TREE" >&2
+            exit 1
+          fi
+
+          echo "SUSFS_LTS_PATCHSET_HEAD=79ecabe1aa6f3d0e00668d5a3902879d67652189" >> "$GITHUB_ENV"
+          echo "SUSFS_LTS_TREE=$ACTUAL_TREE" >> "$GITHUB_ENV"
+          echo "Verified Pershoot LTS tree: $ACTUAL_TREE"
         fi
